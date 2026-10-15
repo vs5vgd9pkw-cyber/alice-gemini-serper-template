@@ -1,10 +1,11 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "gemini-2.5-flash";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
 const GEMINI_TIMEOUT_MS = 2500;
+const DB_TIMEOUT_MS = 400;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -69,6 +70,81 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
+function getConversationId(body) {
+  const userId = body?.session?.user?.user_id || body?.session?.application?.application_id || "anonymous";
+  const skillId = body?.session?.skill_id || "default_skill";
+  return `${skillId}:${userId}`;
+}
+
+async function loadMemory(convId) {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return [];
+
+  try {
+    const endpoint = `${url}/rest/v1/alice_memory?conversation_id=eq.${encodeURIComponent(convId)}&select=history`;
+    const { response, data } = await fetchJson(endpoint, {
+      method: "GET",
+      headers: {
+        "apikey": key,
+        "Authorization": `Bearer ${key}`
+      }
+    }, DB_TIMEOUT_MS);
+
+    if (response.ok && Array.isArray(data) && data[0]?.history) {
+      return safeHistory(data[0].history);
+    }
+  } catch (e) {
+    console.warn("Supabase load fallback:", e.message);
+  }
+  return [];
+}
+
+async function saveMemory(convId, history) {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return;
+
+  try {
+    const endpoint = `${url}/rest/v1/alice_memory`;
+    await fetchJson(endpoint, {
+      method: "POST",
+      headers: {
+        "apikey": key,
+        "Authorization": `Bearer ${key}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates"
+      },
+      body: JSON.stringify({
+        conversation_id: convId,
+        history,
+        updated_at: new Date().toISOString()
+      })
+    }, DB_TIMEOUT_MS);
+  } catch (e) {
+    console.warn("Supabase save fallback:", e.message);
+  }
+}
+
+async function clearMemory(convId) {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return;
+
+  try {
+    const endpoint = `${url}/rest/v1/alice_memory?conversation_id=eq.${encodeURIComponent(convId)}`;
+    await fetchJson(endpoint, {
+      method: "DELETE",
+      headers: {
+        "apikey": key,
+        "Authorization": `Bearer ${key}`
+      }
+    }, DB_TIMEOUT_MS);
+  } catch (e) {
+    console.warn("Supabase clear fallback:", e.message);
+  }
+}
+
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
   if (!key || timeoutMs < 150) return "";
@@ -87,10 +163,7 @@ async function searchWeb(query, timeoutMs) {
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
 
-    if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
-    }
+    if (!response.ok) return "";
 
     const items = (Array.isArray(data.organic) ? data.organic : [])
       .slice(0, 3)
@@ -102,10 +175,9 @@ async function searchWeb(query, timeoutMs) {
       });
 
     const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
+    if (answerBox) items.unshift(`Краткий ответ: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
     return "";
   }
 }
@@ -116,8 +188,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
   const contents = safeHistory(history).map(item => ({
     role: item.role,
     parts: [{ text: item.text }]
@@ -150,43 +220,33 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
+  const answer = (data?.candidates?.[0]?.content?.parts || [])
+    .map(p => typeof p.text === "string" ? p.text : "")
     .join("")
     .trim();
 
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
+  if (!answer) throw new Error("GEMINI_EMPTY_RESPONSE");
   return answer;
 }
 
 function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
+      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY.";
     case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
+      return "Не удалось подключиться к Gemini. Проверьте API-ключ.";
     case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
-      return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+      return "Превышен лимит запросов. Попробуйте немного позже.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
-      return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
+      return "Не успела подготовить ответ. Задайте вопрос чуть короче.";
     default:
-      return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
+      return "Не получилось получить ответ от нейросети. Попробуйте ещё раз.";
   }
 }
 
@@ -194,8 +254,8 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+      service: "alice-gemini-serper-memory",
+      message: "Webhook with Supabase memory is ready."
     });
   }
 
@@ -208,42 +268,50 @@ export default async function handler(req, res) {
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
-  const oldHistory = safeHistory(body?.state?.session?.history);
+  const convId = getConversationId(body);
+
+  if (/^(забудь всё|очисти память|забудь историю|сброс памяти)$/i.test(text)) {
+    await clearMemory(convId);
+    return res.status(200).json(aliceResponse("Хорошо, я забыла всю нашу предыдущую беседу.", false, []));
+  }
+
+  let history = safeHistory(body?.state?.session?.history);
+  if (!history.length) {
+    history = await loadMemory(convId);
+  }
 
   if (!text) {
     return res.status(200).json(aliceResponse(
-      "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
+      "Привет! Я помню наш предыдущий разговор. Что хочешь спросить?",
       false,
-      oldHistory
+      history
     ));
   }
 
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
     const answer = await askGemini(
       text,
-      oldHistory,
+      history,
       searchContext,
       Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
     );
 
-    const history = [
-      ...oldHistory,
+    const updatedHistory = [
+      ...history,
       { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
-    return res.status(200).json(aliceResponse(answer, false, history));
+    saveMemory(convId, updatedHistory);
+
+    return res.status(200).json(aliceResponse(answer, false, updatedHistory));
   } catch (error) {
     const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
+    return res.status(200).json(aliceResponse(errorForUser(safeError), false, history));
   }
 }
-
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
