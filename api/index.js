@@ -1,11 +1,11 @@
-const DEFAULT_MODEL = "gemini-2.5-flash";
+const DEFAULT_MODEL = "gemini-3.8-flash";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
-const DB_TIMEOUT_MS = 400;
+const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const SERPER_TIMEOUT_MS = 800;
+const GEMINI_TIMEOUT_MS = 2800;
+const DB_TIMEOUT_MS = 1500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -185,7 +185,7 @@ async function searchWeb(query, timeoutMs) {
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+  if (timeoutMs < 200) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
   const contents = safeHistory(history).map(item => ({
@@ -220,6 +220,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
+    console.error("Gemini API error status:", status);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
@@ -270,14 +271,18 @@ export default async function handler(req, res) {
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const convId = getConversationId(body);
 
-  if (/^(забудь всё|очисти память|забудь историю|сброс памяти)$/i.test(text)) {
+  if (/^(забудь всё|очисти память|забудь историю|сброс памяти)\$/i.test(text)) {
     await clearMemory(convId);
     return res.status(200).json(aliceResponse("Хорошо, я забыла всю нашу предыдущую беседу.", false, []));
   }
 
   let history = safeHistory(body?.state?.session?.history);
   if (!history.length) {
-    history = await loadMemory(convId);
+    try {
+      history = await loadMemory(convId);
+    } catch (_) {
+      history = [];
+    }
   }
 
   if (!text) {
@@ -298,7 +303,7 @@ export default async function handler(req, res) {
       text,
       history,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 400))
     );
 
     const updatedHistory = [
@@ -307,7 +312,8 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
-    saveMemory(convId, updatedHistory);
+    // Сохраняем историю в базу
+    saveMemory(convId, updatedHistory).catch(() => {});
 
     return res.status(200).json(aliceResponse(answer, false, updatedHistory));
   } catch (error) {
